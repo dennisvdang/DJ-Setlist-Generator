@@ -59,27 +59,33 @@ class Playlist:
         playlist_id = self.playlist_url.split('/')[-1].split('?')[0]
         tracks = []
         results = self.sp.playlist_tracks(playlist_id)
+        track_ids = []
 
-        # Loop through each page of tracks and append to the list
         while results:
-            for item in tqdm(results['items'], desc="Extracting tracks"):
-                track_info = item['track']
-                track_id = track_info['id']
-                audio_features = self.sp.audio_features(track_id)[0]
-                audio_features = {k: v for k, v in audio_features.items(
-                ) if k not in ['type', 'analysis_url', 'duration_ms']}
-                artists = [{'artist_name': artist['name'], 'artist_genres': self.sp.artist(
-                    artist['id'])['genres']} for artist in track_info['artists']]
-                new_track = Track(track_id, track_info,
-                                  audio_features, artists)
-                new_track.calculate_camelot_key()
-                tracks.append(new_track)
-
-            # Check if more tracks are available and fetch the next page
+            track_ids.extend([item['track']['id']
+                             for item in results['items']])
             if results['next']:
                 results = self.sp.next(results)
             else:
                 results = None
+
+        # Retrieve audio features in batches of up to 100 tracks
+        for i in range(0, len(track_ids), 100):
+            batch_ids = track_ids[i:i+100]
+            audio_features_list = self.sp.audio_features(batch_ids)
+            for track_id, audio_features in zip(batch_ids, audio_features_list):
+                if audio_features:
+                    audio_features = {k: v for k, v in audio_features.items(
+                    ) if k not in ['type', 'analysis_url', 'duration_ms']}
+                    track_details = {item['track']['id']: item['track']
+                                     for item in results['items'] if item['track']['id'] in batch_ids}
+                    track_info = track_details[track_id]
+                    artists = [{'artist_name': artist['name']}
+                               for artist in track_info['artists']]
+                    new_track = Track(track_id, track_info,
+                                      audio_features, artists)
+                    new_track.calculate_camelot_key()
+                    tracks.append(new_track)
 
         return tracks
 
@@ -111,47 +117,41 @@ class Playlist:
                 # Treat any other input as a retry attempt
                 return self.select_first_song(response)
 
-    def select_next_song(self, setlist, remaining_tracks, bpm_range=0.05, max_songs=30):
+    def select_next_song(self, setlist, remaining_tracks, max_songs=30):
+        bpm_range = 0.08
         while remaining_tracks and len(setlist) < max_songs:
             current_song = setlist[-1]
             current_bpm = current_song.audio_features['tempo']
-            current_key = current_song.camelot_key
 
+            # Filter for songs within BPM range of current_bpm
             bpm_min, bpm_max = current_bpm * \
                 (1 - bpm_range), current_bpm * (1 + bpm_range)
             filtered_songs = [song for song in remaining_tracks
-                              if bpm_min <= song.audio_features['tempo'] <= bpm_max]
+                              if bpm_min <= song.audio_features['tempo'] <= bpm_max or
+                              bpm_min / 2 <= song.audio_features['tempo'] <= bpm_max / 2]
 
+            # Calculate audio similarity and sort by it
+            for song in filtered_songs:
+                song.audio_similarity_score = current_song.calculate_audio_similarity(
+                    song)
+            filtered_songs.sort(
+                key=lambda x: x.audio_similarity_score, reverse=True)
+
+            # Calculate key compatibility score
             for song in filtered_songs:
                 song.key_compatibility_score = current_song.calculate_key_compatibility_score(
                     song)
 
-            sorted_songs = sorted(
-                filtered_songs, key=lambda x: x.key_compatibility_score, reverse=True)
+            # Select the top candidate based on key compatibility score
+            top_candidates = [song for song in filtered_songs if song.key_compatibility_score == max(
+                song.key_compatibility_score for song in filtered_songs)]
 
-            if sorted_songs:
-                top_candidates = [sorted_songs[0]]
-                for candidate in sorted_songs[1:]:
-                    if candidate.key_compatibility_score == top_candidates[0].key_compatibility_score:
-                        audio_sim, genre_sim = current_song.calculate_similarity_scores(
-                            candidate)
-                        similarity_score = 0.9 * audio_sim + 0.1 * genre_sim
-
-                        if similarity_score > top_candidates[0].key_compatibility_score:
-                            top_candidates = [candidate]
-                        elif similarity_score == top_candidates[0].key_compatibility_score:
-                            top_candidates.append(candidate)
-                    else:
-                        break
-
-                next_song = random.choice(
-                    top_candidates) if top_candidates else None
-                if next_song:
-                    remaining_tracks.remove(next_song)
-                    setlist.append(next_song)
+            if top_candidates:
+                next_song = random.choice(top_candidates)
+                remaining_tracks.remove(next_song)
+                setlist.append(next_song)
             else:
-                # If no songs within the current BPM range, increase the range
-                bpm_range = 0.08
+                bpm_range += 0.02  # Increase BPM range if no suitable song found
 
         return setlist, remaining_tracks
 
@@ -163,6 +163,7 @@ class Track:
         self.audio_features = audio_features
         self.artists = artists
         self.camelot_key = None
+        self.calculate_camelot_key()
 
     def calculate_camelot_key(self):
         key = self.audio_features['key']
@@ -175,33 +176,24 @@ class Track:
             (8, 0): '1A', (8, 1): '4B', (9, 0): '8A', (9, 1): '11B',
             (10, 0): '3A', (10, 1): '6B', (11, 0): '10A', (11, 1): '1B'
         }
-
         self.camelot_key = camelot_map.get((key, mode), None)
 
     def calculate_similarity_scores(self, other_track):
+        """Calculate cosine similarity between the audio features of the two tracks"""
         song1_features = [
             self.audio_features[feat] for feat in [
-                'speechiness', 'acousticness', 'instrumentalness', 'liveness', 'valence', 'tempo'
+                'speechiness', 'acousticness', 'instrumentalness', 'liveness',
+                'valence', 'tempo', 'danceability', 'energy'
             ]
         ]
         song2_features = [
             other_track.audio_features[feat] for feat in [
-                'speechiness', 'acousticness', 'instrumentalness', 'liveness', 'valence', 'tempo'
+                'speechiness', 'acousticness', 'instrumentalness', 'liveness',
+                'valence', 'tempo', 'danceability', 'energy'
             ]
         ]
 
-        audio_similarity = cosine_similarity(
-            [song1_features], [song2_features])[0][0]
-
-        song1_genres = {
-            genre for artist in self.artists for genre in artist['artist_genres']}
-        song2_genres = {
-            genre for artist in other_track.artists for genre in artist['artist_genres']}
-
-        genre_similarity = len(song1_genres & song2_genres) / \
-            len(song1_genres | song2_genres)
-
-        return audio_similarity, genre_similarity
+        return cosine_similarity([song1_features], [song2_features])[0][0]
 
     def calculate_key_compatibility_score(self, other_track):
         key1 = self.camelot_key
